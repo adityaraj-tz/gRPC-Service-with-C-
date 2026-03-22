@@ -1,0 +1,23 @@
+﻿syntax = "proto3";
+
+option csharp_namespace = "GrpcServiceProject";
+
+package book;
+
+// The book service definition
+service BookService {
+  // Saves a book and returns the result
+  rpc SaveBook (BookRequest) returns (BookReply);
+}
+
+// Request message for saving a book
+message BookRequest {
+  string title = 1;
+  int32 pages = 2; 
+}
+
+// Response message with operation result
+message BookReply {
+  bool success = 1;
+  string message = 2;
+}
