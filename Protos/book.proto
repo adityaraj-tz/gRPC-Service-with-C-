@@ -8,6 +8,7 @@ package book;
 service BookService {
   // Saves a book and returns the result
   rpc SaveBook (BookRequest) returns (BookReply);
+  rpc GetBookById (GetBookRequest) returns (GetBookReply);
 }
 
 // Request message for saving a book
@@ -20,4 +21,20 @@ message BookRequest {
 message BookReply {
   bool success = 1;
   string message = 2;
+}
+
+message GetBookReply{
+	bool success = 1;
+	string message = 2;
+	BookData book = 3;
+}
+
+message GetBookRequest {
+  string book_id = 1;
+}
+
+message BookData {
+	string id =1;
+	string title =2 ;
+	int32 pages =3;
 }

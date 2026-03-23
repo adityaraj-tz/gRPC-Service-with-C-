@@ -68,6 +68,67 @@ namespace GrpcServiceProject.Services
                 };
             }
         }
-        
+
+        public override async Task<GetBookReply> GetBookById(GetBookRequest request, ServerCallContext context)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(request.BookId))
+                {
+                    _logger.LogWarning("GetBookById called with empty book ID");
+                    return new GetBookReply
+                    {
+                        Success = false,
+                        Message = "Book ID cannot be empty"
+                    };
+                }
+
+                if (!Guid.TryParse(request.BookId, out var bookId))
+                {
+                    _logger.LogWarning("GetBookById called with invalid GUID: {BookId}", request.BookId);
+                    return new GetBookReply
+                    {
+                        Success = false,
+                        Message = "Invalid book ID format"
+                    };
+                }
+
+                var book = await _session.LoadAsync<Book>(bookId, context.CancellationToken);
+
+                if (book == null)
+                {
+                    _logger.LogInformation("Book not found: {BookId}", bookId);
+                    return new GetBookReply
+                    {
+                        Success = false,
+                        Message = $"Book with ID '{bookId}' not found"
+                    };
+                }
+
+                _logger.LogInformation("Book retrieved: {BookId}, Title: {Title}", book.Id, book.Title);
+
+                return new GetBookReply
+                {
+                    Success = true,
+                    Message = "Book retrieved successfully",
+                    Book = new BookData
+                    {
+                        Id = book.Id.ToString(),
+                        Title = book.Title,
+                        Pages = book.Pages
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error retrieving book: {BookId}", request.BookId);
+
+                return new GetBookReply
+                {
+                    Success = false,
+                    Message = $"Failed to retrieve book: {ex.Message}"
+                };
+            }
+        }
     }
 }
