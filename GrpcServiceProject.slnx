@@ -1,4 +1,5 @@
 <Solution>
   <Project Path="GrpcServiceProject.csproj" />
-  <Project Path="NatsCoreApp/NatsCoreApp.csproj" />
+  <Project Path="NatsPublisher/NatsPublisher.csproj" />
+  <Project Path="NatsSubscriber/NatsSubscriber.csproj" />
 </Solution>
