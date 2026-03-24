@@ -1,11 +1,15 @@
 using NATS.Client.Core;
+using NATS.Client.JetStream;
+using NATS.Client.JetStream.Models;
 
-Console.WriteLine("=== NATS Subscriber ===");
+Console.WriteLine("=== NATS JetStream Subscriber ===");
 Console.WriteLine("Connecting to NATS at nats://localhost:4222 ...");
 
 var opts = new NatsOpts { Url = "nats://localhost:4222" };
 await using var nats = new NatsConnection(opts);
 await nats.ConnectAsync();
+
+var js = new NatsJSContext(nats);
 
 Console.WriteLine("Connected!\n");
 
@@ -20,10 +24,10 @@ Console.CancelKeyPress += (_, e) =>
 while (true)
 {
     Console.WriteLine("Choose a demo:");
-    Console.WriteLine("  1. Subscribe to messages (Pub/Sub)");
-    Console.WriteLine("  2. Reply to requests (Request/Reply)");
-    Console.WriteLine("  3. Queue group consumer (load balancing)");
-    Console.WriteLine("  4. Wildcard subscriptions");
+    Console.WriteLine("  1. Durable consumer (survives restarts)");
+    Console.WriteLine("  2. Ephemeral consumer (temporary, replays all)");
+    Console.WriteLine("  3. Fetch messages in batch (pull N at a time)");
+    Console.WriteLine("  4. View stream & consumer info");
     Console.WriteLine("  0. Exit");
     Console.Write("> ");
 
@@ -32,108 +36,167 @@ while (true)
 
     switch (choice)
     {
-        case "1": await SubscribeMessages(nats, cts.Token); break;
-        case "2": await ReplyToRequests(nats, cts.Token); break;
-        case "3": await QueueGroupConsumer(nats, cts.Token); break;
-        case "4": await WildcardSubscriptions(nats, cts.Token); break;
+        case "1": await DurableConsumer(js, cts.Token); break;
+        case "2": await EphemeralConsumer(js, cts.Token); break;
+        case "3": await FetchMessages(js, cts.Token); break;
+        case "4": await ViewInfo(js); break;
         case "0": return;
         default: Console.WriteLine("Unknown option.\n"); break;
     }
 }
 
-// ─── 1. Subscribe to messages ───────────────────────────────────────────────
+// ─── 1. Durable consumer ──────────────────────────────────────────────────────
 
-static async Task SubscribeMessages(NatsConnection nats, CancellationToken ct)
+static async Task DurableConsumer(NatsJSContext js, CancellationToken ct)
 {
-    Console.WriteLine("--- Subscribe Messages (Pub/Sub) ---");
-    Console.WriteLine("Subject: demo.messages");
-    Console.WriteLine("Waiting for messages... (press Ctrl+C to stop)\n");
+    Console.WriteLine("--- Durable Consumer ---");
+    Console.WriteLine("Consumer: order-processor (durable)");
+    Console.WriteLine("This consumer remembers its position across restarts.");
+    Console.WriteLine("Listening on: orders.> (press Ctrl+C to stop)\n");
+
+    var consumer = await js.CreateOrUpdateConsumerAsync("ORDERS", new ConsumerConfig("order-processor")
+    {
+        DurableName = "order-processor",
+        DeliverPolicy = ConsumerConfigDeliverPolicy.All,
+        AckPolicy = ConsumerConfigAckPolicy.Explicit,
+        FilterSubject = "orders.>",
+        AckWait = TimeSpan.FromSeconds(30),
+        MaxDeliver = 3,
+    });
+
+    Console.WriteLine("[CONSUMER] Durable consumer 'order-processor' ready.\n");
 
     try
     {
-        await foreach (var msg in nats.SubscribeAsync<string>("demo.messages", cancellationToken: ct))
+        await foreach (var msg in consumer.ConsumeAsync<string>(cancellationToken: ct))
         {
-            Console.WriteLine($"  [SUB] Received: \"{msg.Data}\" (subject: {msg.Subject})");
+            Console.WriteLine($"  [RECV] Subject: {msg.Subject,-25} | Data: {msg.Data}");
+
+            if (msg.Headers?.Count > 0)
+            {
+                foreach (var h in msg.Headers)
+                    Console.WriteLine($"         Header: {h.Key} = {string.Join(", ", h.Value.ToArray())}");
+            }
+
+            await msg.AckAsync(cancellationToken: ct);
+            Console.WriteLine("         -> Acked\n");
         }
     }
     catch (OperationCanceledException) { }
 
-    Console.WriteLine("Subscription stopped.\n");
+    Console.WriteLine("Durable consumer stopped. Position is saved — restart to continue where you left off.\n");
 }
 
-// ─── 2. Reply to requests ───────────────────────────────────────────────────
+// ─── 2. Ephemeral consumer ────────────────────────────────────────────────────
 
-static async Task ReplyToRequests(NatsConnection nats, CancellationToken ct)
+static async Task EphemeralConsumer(NatsJSContext js, CancellationToken ct)
 {
-    Console.WriteLine("--- Reply to Requests (Request/Reply) ---");
-    Console.WriteLine("Subject: demo.request");
-    Console.WriteLine("Listening for requests and replying with UPPERCASE... (press Ctrl+C to stop)\n");
+    Console.WriteLine("--- Ephemeral Consumer ---");
+    Console.WriteLine("This consumer is temporary and does NOT survive restarts.");
+    Console.WriteLine("It replays ALL messages from the beginning of the stream.");
+    Console.WriteLine("Listening on: orders.> (press Ctrl+C to stop)\n");
 
+    var consumer = await js.CreateOrUpdateConsumerAsync("ORDERS", new ConsumerConfig
+    {
+        DeliverPolicy = ConsumerConfigDeliverPolicy.All,
+        AckPolicy = ConsumerConfigAckPolicy.Explicit,
+        FilterSubject = "orders.>",
+        InactiveThreshold = TimeSpan.FromSeconds(30),
+    });
+
+    Console.WriteLine("[CONSUMER] Ephemeral consumer created (auto-deletes after 30s inactivity).\n");
+
+    int count = 0;
     try
     {
-        await foreach (var msg in nats.SubscribeAsync<string>("demo.request", cancellationToken: ct))
+        await foreach (var msg in consumer.ConsumeAsync<string>(cancellationToken: ct))
         {
-            var response = msg.Data?.ToUpperInvariant() ?? string.Empty;
-            Console.WriteLine($"  [REPLIER] Got \"{msg.Data}\" -> replying \"{response}\"");
-            await msg.ReplyAsync(response);
+            count++;
+            Console.WriteLine($"  [RECV #{count}] Subject: {msg.Subject,-25} | Data: {msg.Data}");
+            await msg.AckAsync(cancellationToken: ct);
         }
     }
     catch (OperationCanceledException) { }
 
-    Console.WriteLine("Replier stopped.\n");
+    Console.WriteLine($"Ephemeral consumer stopped. Received {count} messages total.\n");
 }
 
-// ─── 3. Queue group consumer ────────────────────────────────────────────────
+// ─── 3. Fetch messages in batch ───────────────────────────────────────────────
 
-static async Task QueueGroupConsumer(NatsConnection nats, CancellationToken ct)
+static async Task FetchMessages(NatsJSContext js, CancellationToken ct)
 {
-    Console.Write("Enter worker ID (e.g. 1, 2, 3): ");
-    var idInput = Console.ReadLine()?.Trim();
-    var workerId = string.IsNullOrEmpty(idInput) ? "1" : idInput;
+    Console.Write("How many messages to fetch? (default 5): ");
+    var input = Console.ReadLine()?.Trim();
+    int maxMsgs = int.TryParse(input, out var n) && n > 0 ? n : 5;
 
-    Console.WriteLine($"\n--- Queue Group Consumer (Worker-{workerId}) ---");
-    Console.WriteLine("Subject: demo.work | Queue group: workers");
-    Console.WriteLine("Waiting for tasks... (press Ctrl+C to stop)\n");
+    Console.WriteLine($"\n--- Fetch {maxMsgs} Messages ---");
+    Console.WriteLine("Using durable consumer 'batch-fetcher'.\n");
 
+    var consumer = await js.CreateOrUpdateConsumerAsync("ORDERS", new ConsumerConfig("batch-fetcher")
+    {
+        DurableName = "batch-fetcher",
+        DeliverPolicy = ConsumerConfigDeliverPolicy.All,
+        AckPolicy = ConsumerConfigAckPolicy.Explicit,
+        FilterSubject = "orders.>",
+    });
+
+    int count = 0;
     try
     {
-        await foreach (var msg in nats.SubscribeAsync<string>("demo.work", queueGroup: "workers", cancellationToken: ct))
+        await foreach (var msg in consumer.FetchAsync<string>(new NatsJSFetchOpts { MaxMsgs = maxMsgs }, cancellationToken: ct))
         {
-            Console.WriteLine($"  [WORKER-{workerId}] Handled: \"{msg.Data}\"");
-            await Task.Delay(50, ct); // simulate work
+            count++;
+            Console.WriteLine($"  [FETCH #{count}] Subject: {msg.Subject,-25} | Data: {msg.Data}");
+            await msg.AckAsync(cancellationToken: ct);
         }
     }
     catch (OperationCanceledException) { }
 
-    Console.WriteLine($"Worker-{workerId} stopped.\n");
+    Console.WriteLine($"\nFetched {count} messages (requested {maxMsgs}).\n");
 }
 
-// ─── 4. Wildcard subscriptions ──────────────────────────────────────────────
+// ─── 4. View stream & consumer info ───────────────────────────────────────────
 
-static async Task WildcardSubscriptions(NatsConnection nats, CancellationToken ct)
+static async Task ViewInfo(NatsJSContext js)
 {
-    Console.WriteLine("--- Wildcard Subscriptions ---");
-    Console.WriteLine("  'sensor.*'  -> matches one token  (e.g. sensor.temp)");
-    Console.WriteLine("  'sensor.>'  -> matches all tokens (e.g. sensor.room1.humidity)");
-    Console.WriteLine("Listening... (press Ctrl+C to stop)\n");
-
-    var singleTask = Task.Run(async () =>
-    {
-        await foreach (var msg in nats.SubscribeAsync<string>("sensor.*", cancellationToken: ct))
-            Console.WriteLine($"  [sensor.*] subject={msg.Subject,-30} data={msg.Data}");
-    }, ct);
-
-    var multiTask = Task.Run(async () =>
-    {
-        await foreach (var msg in nats.SubscribeAsync<string>("sensor.>", cancellationToken: ct))
-            Console.WriteLine($"  [sensor.>] subject={msg.Subject,-30} data={msg.Data}");
-    }, ct);
+    Console.WriteLine("--- Stream & Consumer Info ---\n");
 
     try
     {
-        await Task.WhenAll(singleTask, multiTask);
-    }
-    catch (OperationCanceledException) { }
+        var stream = await js.GetStreamAsync("ORDERS");
+        var info = stream.Info;
 
-    Console.WriteLine("Wildcard subscriptions stopped.\n");
+        Console.WriteLine("  STREAM: ORDERS");
+        Console.WriteLine($"    Subjects      : {string.Join(", ", info.Config.Subjects ?? [])}");
+        Console.WriteLine($"    Storage       : {info.Config.Storage}");
+        Console.WriteLine($"    Messages      : {info.State.Messages}");
+        Console.WriteLine($"    Bytes         : {info.State.Bytes}");
+        Console.WriteLine($"    First Seq     : {info.State.FirstSeq}");
+        Console.WriteLine($"    Last Seq      : {info.State.LastSeq}");
+        Console.WriteLine($"    Consumer Cnt  : {info.State.ConsumerCount}");
+        Console.WriteLine($"    Retention     : {info.Config.Retention}");
+        Console.WriteLine($"    Max Age       : {info.Config.MaxAge}");
+        Console.WriteLine($"    Max Msgs      : {info.Config.MaxMsgs}");
+        Console.WriteLine();
+
+        Console.WriteLine("  CONSUMERS:");
+        await foreach (var c in js.ListConsumersAsync("ORDERS"))
+        {
+            var ci = c.Info;
+            var name = ci.Config.DurableName ?? ci.Name;
+            var kind = ci.Config.DurableName != null ? "durable" : "ephemeral";
+
+            Console.WriteLine($"    - {name} ({kind})");
+            Console.WriteLine($"      Pending      : {ci.NumPending}");
+            Console.WriteLine($"      Ack Pending  : {ci.NumAckPending}");
+            Console.WriteLine($"      Redelivered  : {ci.NumRedelivered}");
+            Console.WriteLine($"      Delivered    : {ci.Delivered.ConsumerSeq}");
+            Console.WriteLine();
+        }
+    }
+    catch (NatsJSApiException e)
+    {
+        Console.WriteLine($"  Error: {e.Error.Description}");
+        Console.WriteLine("  (Is the ORDERS stream created? Run the Publisher first.)\n");
+    }
 }
